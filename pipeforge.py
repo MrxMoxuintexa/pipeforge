@@ -9,18 +9,228 @@ No AI, no API keys, no external dependencies.
 Author: Sheraz Khan (@Sheraz-k)
 License: MIT
 Repository: https://github.com/Sheraz-k/pipeforge
+
+Security: All user inputs are validated and sanitized.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Sheraz Khan"
 
 import os
+import re
 import sys
 import argparse
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from enum import Enum
+
+
+# ============================================
+# SECURITY & VALIDATION
+# ============================================
+
+class ValidationError(Exception):
+    """Raised when input validation fails"""
+    pass
+
+
+class SecurityError(Exception):
+    """Raised when security check fails"""
+    pass
+
+
+# Regex patterns for validation
+PATTERNS = {
+    'service_name': re.compile(r'^[a-z][a-z0-9-]{0,62}[a-z0-9]$|^[a-z]$'),
+    'aws_region': re.compile(r'^[a-z]{2}-[a-z]+-\d$'),
+    'environment': re.compile(r'^[a-z][a-z0-9-]{0,30}[a-z0-9]$|^[a-z]$'),
+    'version': re.compile(r'^\d+(\.\d+)*$'),
+}
+
+# Dangerous patterns to reject
+DANGEROUS_PATTERNS = [
+    r'\.\.',           # Path traversal
+    r'[;&|`$]',        # Command injection
+    r'[\x00-\x1f]',    # Control characters
+    r'[<>"\']',        # HTML/Shell special chars
+    r'\\',             # Backslash
+]
+
+
+def sanitize_string(value: str, field_name: str, max_length: int = 63) -> str:
+    """
+    Sanitize and validate a string input.
+
+    Args:
+        value: The input string to sanitize
+        field_name: Name of the field (for error messages)
+        max_length: Maximum allowed length
+
+    Returns:
+        Sanitized string
+
+    Raises:
+        ValidationError: If validation fails
+        SecurityError: If dangerous patterns detected
+    """
+    if not isinstance(value, str):
+        raise ValidationError(f"{field_name} must be a string, got {type(value).__name__}")
+
+    # Check for dangerous patterns
+    for pattern in DANGEROUS_PATTERNS:
+        if re.search(pattern, value):
+            raise SecurityError(f"{field_name} contains potentially dangerous characters")
+
+    # Strip whitespace
+    value = value.strip()
+
+    # Check empty
+    if not value:
+        raise ValidationError(f"{field_name} cannot be empty")
+
+    # Check length
+    if len(value) > max_length:
+        raise ValidationError(f"{field_name} exceeds maximum length of {max_length} characters")
+
+    return value
+
+
+def validate_service_name(name: str) -> str:
+    """
+    Validate and sanitize service name.
+    Must be lowercase alphanumeric with hyphens, start with letter.
+
+    Args:
+        name: Service name to validate
+
+    Returns:
+        Validated service name
+
+    Raises:
+        ValidationError: If validation fails
+    """
+    name = sanitize_string(name, "service_name", max_length=63)
+
+    # Convert to lowercase and replace invalid chars
+    name = name.lower()
+    name = re.sub(r'[^a-z0-9-]', '-', name)
+    name = re.sub(r'-+', '-', name)  # Collapse multiple hyphens
+    name = name.strip('-')  # Remove leading/trailing hyphens
+
+    if not name:
+        raise ValidationError("service_name results in empty string after sanitization")
+
+    # Ensure starts with letter
+    if not name[0].isalpha():
+        name = 'svc-' + name
+
+    if not PATTERNS['service_name'].match(name):
+        raise ValidationError(
+            f"service_name '{name}' is invalid. Must be lowercase alphanumeric with hyphens, "
+            "start with a letter, max 63 chars."
+        )
+
+    return name
+
+
+def validate_aws_region(region: str) -> str:
+    """
+    Validate AWS region format.
+
+    Args:
+        region: AWS region string
+
+    Returns:
+        Validated region
+
+    Raises:
+        ValidationError: If validation fails
+    """
+    region = sanitize_string(region, "aws_region", max_length=20)
+    region = region.lower()
+
+    if not PATTERNS['aws_region'].match(region):
+        raise ValidationError(
+            f"aws_region '{region}' is invalid. Expected format: us-east-1, eu-west-2, etc."
+        )
+
+    return region
+
+
+def validate_environment(env: str) -> str:
+    """
+    Validate environment name.
+
+    Args:
+        env: Environment name
+
+    Returns:
+        Validated environment name
+
+    Raises:
+        ValidationError: If validation fails
+    """
+    env = sanitize_string(env, "environment", max_length=32)
+    env = env.lower()
+    env = re.sub(r'[^a-z0-9-]', '-', env)
+    env = env.strip('-')
+
+    if not env:
+        raise ValidationError("environment results in empty string after sanitization")
+
+    if not PATTERNS['environment'].match(env):
+        raise ValidationError(f"environment '{env}' is invalid")
+
+    return env
+
+
+def validate_environments(envs: List[str]) -> List[str]:
+    """
+    Validate list of environments.
+
+    Args:
+        envs: List of environment names
+
+    Returns:
+        Validated list of environments
+
+    Raises:
+        ValidationError: If validation fails
+    """
+    if not isinstance(envs, list):
+        raise ValidationError("environments must be a list")
+
+    if not envs:
+        raise ValidationError("environments cannot be empty")
+
+    if len(envs) > 10:
+        raise ValidationError("Maximum 10 environments allowed")
+
+    validated = []
+    seen = set()
+    for env in envs:
+        env = validate_environment(env)
+        if env in seen:
+            raise ValidationError(f"Duplicate environment: {env}")
+        seen.add(env)
+        validated.append(env)
+
+    return validated
+
+
+def escape_yaml_string(value: str) -> str:
+    """Escape a string for safe YAML embedding"""
+    # If contains special chars, quote it
+    if any(c in value for c in ':{}[]&*#?|-<>=!%@`'):
+        return f'"{value}"'
+    return value
+
+
+def escape_shell_string(value: str) -> str:
+    """Escape a string for safe shell embedding"""
+    # Use single quotes and escape any single quotes in the string
+    return "'" + value.replace("'", "'\\''") + "'"
 
 
 # ============================================
@@ -37,14 +247,22 @@ class Platform(Enum):
 
     @classmethod
     def from_string(cls, s: str) -> 'Platform':
+        s = sanitize_string(s, "platform", max_length=20).lower()
         mapping = {
             'github': cls.GITHUB_ACTIONS,
+            'github-actions': cls.GITHUB_ACTIONS,
             'gitlab': cls.GITLAB_CI,
+            'gitlab-ci': cls.GITLAB_CI,
             'circleci': cls.CIRCLECI,
+            'circle': cls.CIRCLECI,
             'bitbucket': cls.BITBUCKET,
             'azure': cls.AZURE_PIPELINES,
+            'azure-pipelines': cls.AZURE_PIPELINES,
         }
-        return mapping.get(s.lower(), cls.GITHUB_ACTIONS)
+        if s not in mapping:
+            valid = ', '.join(sorted(set(mapping.keys())))
+            raise ValidationError(f"Unknown platform '{s}'. Valid options: {valid}")
+        return mapping[s]
 
 
 class Language(Enum):
@@ -58,15 +276,19 @@ class Language(Enum):
 
     @classmethod
     def from_string(cls, s: str) -> 'Language':
+        s = sanitize_string(s, "language", max_length=20).lower()
         mapping = {
-            'nodejs': cls.NODEJS, 'node': cls.NODEJS, 'javascript': cls.NODEJS,
+            'nodejs': cls.NODEJS, 'node': cls.NODEJS, 'javascript': cls.NODEJS, 'js': cls.NODEJS,
             'python': cls.PYTHON, 'py': cls.PYTHON,
             'go': cls.GO, 'golang': cls.GO,
-            'java': cls.JAVA,
-            'dotnet': cls.DOTNET, 'csharp': cls.DOTNET, '.net': cls.DOTNET,
-            'rust': cls.RUST,
+            'java': cls.JAVA, 'kotlin': cls.JAVA,
+            'dotnet': cls.DOTNET, 'csharp': cls.DOTNET, '.net': cls.DOTNET, 'c#': cls.DOTNET,
+            'rust': cls.RUST, 'rs': cls.RUST,
         }
-        return mapping.get(s.lower(), cls.NODEJS)
+        if s not in mapping:
+            valid = ', '.join(sorted(set(mapping.keys())))
+            raise ValidationError(f"Unknown language '{s}'. Valid options: {valid}")
+        return mapping[s]
 
 
 class Target(Enum):
@@ -84,11 +306,12 @@ class Target(Enum):
 
     @classmethod
     def from_string(cls, s: str) -> 'Target':
+        s = sanitize_string(s, "target", max_length=20).lower()
         mapping = {
-            'ecs': cls.ECS,
+            'ecs': cls.ECS, 'fargate': cls.ECS,
             'eks': cls.EKS,
             'apprunner': cls.APP_RUNNER, 'app-runner': cls.APP_RUNNER,
-            'lambda': cls.LAMBDA,
+            'lambda': cls.LAMBDA, 'aws-lambda': cls.LAMBDA,
             'ssh': cls.EC2_SSH, 'ec2': cls.EC2_SSH, 'vm': cls.EC2_SSH,
             'aks': cls.AKS,
             'appservice': cls.APP_SERVICE, 'app-service': cls.APP_SERVICE,
@@ -96,7 +319,10 @@ class Target(Enum):
             'gke': cls.GKE,
             'k8s': cls.KUBERNETES, 'kubernetes': cls.KUBERNETES,
         }
-        return mapping.get(s.lower(), cls.ECS)
+        if s not in mapping:
+            valid = ', '.join(sorted(set(mapping.keys())))
+            raise ValidationError(f"Unknown target '{s}'. Valid options: {valid}")
+        return mapping[s]
 
 
 class Registry(Enum):
@@ -110,15 +336,19 @@ class Registry(Enum):
 
     @classmethod
     def from_string(cls, s: str) -> 'Registry':
+        s = sanitize_string(s, "registry", max_length=20).lower()
         mapping = {
-            'ecr': cls.ECR,
+            'ecr': cls.ECR, 'aws': cls.ECR,
             'dockerhub': cls.DOCKERHUB, 'docker': cls.DOCKERHUB,
             'ghcr': cls.GHCR, 'github': cls.GHCR,
             'acr': cls.ACR, 'azure': cls.ACR,
-            'gar': cls.GAR, 'google': cls.GAR,
+            'gar': cls.GAR, 'google': cls.GAR, 'gcr': cls.GAR,
             'gitlab': cls.GITLAB,
         }
-        return mapping.get(s.lower(), cls.ECR)
+        if s not in mapping:
+            valid = ', '.join(sorted(set(mapping.keys())))
+            raise ValidationError(f"Unknown registry '{s}'. Valid options: {valid}")
+        return mapping[s]
 
 
 # ============================================
@@ -207,7 +437,10 @@ LANG_CONFIG = {
 
 @dataclass
 class PipelineConfig:
-    """Configuration for pipeline generation"""
+    """
+    Configuration for pipeline generation.
+    All inputs are validated on initialization.
+    """
     service_name: str = "my-app"
     platform: Platform = Platform.GITHUB_ACTIONS
     language: Language = Language.NODEJS
@@ -221,15 +454,31 @@ class PipelineConfig:
     include_tests: bool = True
     include_security_scan: bool = True
 
+    def __post_init__(self):
+        """Validate all inputs after initialization"""
+        self.service_name = validate_service_name(self.service_name)
+        self.aws_region = validate_aws_region(self.aws_region)
+        self.environments = validate_environments(self.environments)
+
+        # Validate version strings
+        for attr in ['node_version', 'python_version', 'go_version']:
+            val = getattr(self, attr)
+            if not re.match(r'^[\d.]+$', val):
+                raise ValidationError(f"{attr} must contain only digits and dots")
+
 
 # ============================================
 # GITHUB ACTIONS GENERATOR
 # ============================================
 
 def generate_github_actions(config: PipelineConfig) -> Dict[str, str]:
-    """Generate GitHub Actions workflow"""
+    """Generate GitHub Actions workflow with security best practices"""
     lang = LANG_CONFIG[config.language]
     files = {}
+
+    # Use validated/escaped values
+    svc = config.service_name
+    region = config.aws_region
 
     workflow = f'''name: CI/CD Pipeline
 
@@ -241,8 +490,8 @@ on:
   workflow_dispatch:
 
 env:
-  SERVICE_NAME: {config.service_name}
-  AWS_REGION: {config.aws_region}
+  SERVICE_NAME: {svc}
+  AWS_REGION: {region}
 
 permissions:
   contents: read
@@ -311,6 +560,7 @@ jobs:
       - uses: codecov/codecov-action@v4
         with:
           token: ${{{{ secrets.CODECOV_TOKEN }}}}
+        continue-on-error: true
 '''
         elif config.language == Language.PYTHON:
             workflow += f'''
@@ -354,6 +604,7 @@ jobs:
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
 '''
 
     # Build job
@@ -388,8 +639,8 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{{{ steps.login-ecr.outputs.registry }}}}/{config.service_name}:${{{{ github.sha }}}}
-            ${{{{ steps.login-ecr.outputs.registry }}}}/{config.service_name}:latest
+            ${{{{ steps.login-ecr.outputs.registry }}}}/{svc}:${{{{ github.sha }}}}
+            ${{{{ steps.login-ecr.outputs.registry }}}}/{svc}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 '''
@@ -427,21 +678,21 @@ jobs:
         uses: aws-actions/amazon-ecs-deploy-task-definition@v1
         with:
           task-definition: ecs-task-definition-{env}.json
-          service: {config.service_name}-{env}
-          cluster: {config.service_name}-{env}
+          service: {svc}-{env}
+          cluster: {svc}-{env}
           wait-for-service-stability: true
 '''
         elif config.target == Target.EKS:
             workflow += f'''
       - name: Update kubeconfig
-        run: aws eks update-kubeconfig --name {config.service_name}-{env} --region ${{{{ env.AWS_REGION }}}}
+        run: aws eks update-kubeconfig --name {svc}-{env} --region ${{{{ env.AWS_REGION }}}}
 
       - name: Deploy to EKS
         run: |
-          kubectl set image deployment/{config.service_name} \\
-            {config.service_name}=${{{{ needs.build.outputs.image_tag }}}} \\
-            -n {config.service_name}-{env}
-          kubectl rollout status deployment/{config.service_name} -n {config.service_name}-{env} --timeout=300s
+          kubectl set image deployment/{svc} \\
+            {svc}=${{{{ needs.build.outputs.image_tag }}}} \\
+            -n {svc}-{env}
+          kubectl rollout status deployment/{svc} -n {svc}-{env} --timeout=300s
 '''
         elif config.target == Target.EC2_SSH:
             workflow += f'''
@@ -452,19 +703,20 @@ jobs:
           username: deploy
           key: ${{{{ secrets.SSH_PRIVATE_KEY }}}}
           script: |
-            docker pull ${{{{ secrets.ECR_REGISTRY }}}}/{config.service_name}:${{{{ github.sha }}}}
-            docker stop {config.service_name} || true
-            docker rm {config.service_name} || true
-            docker run -d --name {config.service_name} --restart unless-stopped \\
+            set -euo pipefail
+            docker pull ${{{{ secrets.ECR_REGISTRY }}}}/{svc}:${{{{ github.sha }}}}
+            docker stop {svc} || true
+            docker rm {svc} || true
+            docker run -d --name {svc} --restart unless-stopped \\
               -p {lang["port"]}:{lang["port"]} -e NODE_ENV={env} \\
-              ${{{{ secrets.ECR_REGISTRY }}}}/{config.service_name}:${{{{ github.sha }}}}
+              ${{{{ secrets.ECR_REGISTRY }}}}/{svc}:${{{{ github.sha }}}}
 '''
 
         workflow += f'''
       - name: Health check
         run: |
           sleep 30
-          curl -sf ${{{{ secrets.{env.upper()}_URL }}}}/health || exit 1
+          curl -sf --retry 5 --retry-delay 10 ${{{{ secrets.{env.upper()}_URL }}}}/health || exit 1
 '''
 
     files[".github/workflows/ci-cd.yml"] = workflow
@@ -479,9 +731,10 @@ def generate_gitlab_ci(config: PipelineConfig) -> Dict[str, str]:
     """Generate GitLab CI configuration"""
     lang = LANG_CONFIG[config.language]
     files = {}
+    svc = config.service_name
 
-    gitlab_ci = f'''# GitLab CI/CD for {config.service_name}
-# Generated by PipeForge
+    gitlab_ci = f'''# GitLab CI/CD for {svc}
+# Generated by PipeForge v{__version__}
 
 stages:
   - lint
@@ -492,7 +745,7 @@ stages:
 
 variables:
   DOCKER_DRIVER: overlay2
-  SERVICE_NAME: {config.service_name}
+  SERVICE_NAME: {svc}
 
 .cache_config: &cache_config
   cache:
@@ -529,6 +782,7 @@ test:
       coverage_report:
         coverage_format: cobertura
         path: coverage/cobertura-coverage.xml
+    expire_in: 1 week
 '''
 
     if config.include_security_scan:
@@ -568,10 +822,10 @@ deploy_{env}:
   image: bitnami/kubectl:latest
   environment:
     name: {env}
-    url: https://{config.service_name}.{env}.example.com
+    url: https://{svc}.{env}.example.com
   script:
-    - kubectl set image deployment/{config.service_name} {config.service_name}=$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA -n {config.service_name}-{env}
-    - kubectl rollout status deployment/{config.service_name} -n {config.service_name}-{env} --timeout=300s
+    - kubectl set image deployment/{svc} {svc}=$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA -n {svc}-{env}
+    - kubectl rollout status deployment/{svc} -n {svc}-{env} --timeout=300s
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       when: {when}
@@ -589,6 +843,7 @@ def generate_circleci(config: PipelineConfig) -> Dict[str, str]:
     """Generate CircleCI configuration"""
     lang = LANG_CONFIG[config.language]
     files = {}
+    svc = config.service_name
 
     circleci = f'''version: 2.1
 
@@ -655,9 +910,10 @@ jobs:
           version: default
       - aws-cli/setup
       - run: |
+          set -euo pipefail
           aws ecr get-login-password --region {config.aws_region} | docker login --username AWS --password-stdin $ECR_REGISTRY
-          docker build -t $ECR_REGISTRY/{config.service_name}:$CIRCLE_SHA1 .
-          docker push $ECR_REGISTRY/{config.service_name}:$CIRCLE_SHA1
+          docker build -t $ECR_REGISTRY/{svc}:$CIRCLE_SHA1 .
+          docker push $ECR_REGISTRY/{svc}:$CIRCLE_SHA1
 '''
 
     for env in config.environments:
@@ -670,13 +926,15 @@ jobs:
           fingerprints:
             - "$SSH_KEY_FINGERPRINT"
       - run: |
+          set -euo pipefail
           IFS=',' read -ra HOSTS <<< "$SSH_HOSTS_{env.upper()}"
           for HOST in "${{HOSTS[@]}}"; do
-            ssh -o StrictHostKeyChecking=no deploy@$HOST << 'EOF'
-              docker pull $ECR_REGISTRY/{config.service_name}:$CIRCLE_SHA1
-              docker stop {config.service_name} || true && docker rm {config.service_name} || true
-              docker run -d --name {config.service_name} --restart unless-stopped -p {lang["port"]}:{lang["port"]} $ECR_REGISTRY/{config.service_name}:$CIRCLE_SHA1
-          EOF
+            ssh -o StrictHostKeyChecking=no deploy@"$HOST" << 'EOF'
+              set -euo pipefail
+              docker pull $ECR_REGISTRY/{svc}:$CIRCLE_SHA1
+              docker stop {svc} || true && docker rm {svc} || true
+              docker run -d --name {svc} --restart unless-stopped -p {lang["port"]}:{lang["port"]} $ECR_REGISTRY/{svc}:$CIRCLE_SHA1
+EOF
           done
 '''
         else:
@@ -686,8 +944,9 @@ jobs:
     steps:
       - aws-cli/setup
       - run: |
-          aws ecs update-service --cluster {config.service_name}-{env} --service {config.service_name} --force-new-deployment
-          aws ecs wait services-stable --cluster {config.service_name}-{env} --services {config.service_name}
+          set -euo pipefail
+          aws ecs update-service --cluster {svc}-{env} --service {svc} --force-new-deployment
+          aws ecs wait services-stable --cluster {svc}-{env} --services {svc}
 '''
 
     # Workflows
@@ -745,6 +1004,7 @@ def generate_bitbucket(config: PipelineConfig) -> Dict[str, str]:
     """Generate Bitbucket Pipelines configuration"""
     lang = LANG_CONFIG[config.language]
     files = {}
+    svc = config.service_name
 
     if config.target == Target.EC2_SSH:
         deploy_cmd = f'''            - pipe: atlassian/ssh-run:0.8.1
@@ -752,22 +1012,23 @@ def generate_bitbucket(config: PipelineConfig) -> Dict[str, str]:
                 SSH_USER: 'deploy'
                 SERVER: '$SSH_HOSTS'
                 COMMAND: |
+                  set -euo pipefail
                   docker pull $DOCKER_IMAGE
-                  docker stop {config.service_name} || true
-                  docker rm {config.service_name} || true
-                  docker run -d --name {config.service_name} --restart unless-stopped -p {lang["port"]}:{lang["port"]} $DOCKER_IMAGE'''
+                  docker stop {svc} || true
+                  docker rm {svc} || true
+                  docker run -d --name {svc} --restart unless-stopped -p {lang["port"]}:{lang["port"]} $DOCKER_IMAGE'''
     else:
         deploy_cmd = f'''            - pipe: atlassian/aws-ecs-deploy:1.9.0
               variables:
                 AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
                 AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
                 AWS_DEFAULT_REGION: '{config.aws_region}'
-                CLUSTER_NAME: '{config.service_name}-$ENVIRONMENT'
-                SERVICE_NAME: '{config.service_name}'
+                CLUSTER_NAME: '{svc}-$ENVIRONMENT'
+                SERVICE_NAME: '{svc}'
                 TASK_DEFINITION: 'task-def.json' '''
 
-    bitbucket = f'''# Bitbucket Pipelines for {config.service_name}
-# Generated by PipeForge
+    bitbucket = f'''# Bitbucket Pipelines for {svc}
+# Generated by PipeForge v{__version__}
 
 image: {lang["image"]}
 
@@ -795,7 +1056,7 @@ definitions:
               AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
               AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
               AWS_DEFAULT_REGION: '{config.aws_region}'
-              IMAGE_NAME: {config.service_name}
+              IMAGE_NAME: {svc}
               TAGS: '$BITBUCKET_COMMIT latest'
 
 pipelines:
@@ -813,7 +1074,7 @@ pipelines:
           deployment: dev
           script:
             - export ENVIRONMENT=dev
-            - export DOCKER_IMAGE="$ECR_REGISTRY/{config.service_name}:$BITBUCKET_COMMIT"
+            - export DOCKER_IMAGE="$ECR_REGISTRY/{svc}:$BITBUCKET_COMMIT"
 {deploy_cmd}
 
     main:
@@ -825,7 +1086,7 @@ pipelines:
           deployment: staging
           script:
             - export ENVIRONMENT=staging
-            - export DOCKER_IMAGE="$ECR_REGISTRY/{config.service_name}:$BITBUCKET_COMMIT"
+            - export DOCKER_IMAGE="$ECR_REGISTRY/{svc}:$BITBUCKET_COMMIT"
 {deploy_cmd}
       - step:
           name: Deploy to Prod
@@ -833,7 +1094,7 @@ pipelines:
           trigger: manual
           script:
             - export ENVIRONMENT=prod
-            - export DOCKER_IMAGE="$ECR_REGISTRY/{config.service_name}:$BITBUCKET_COMMIT"
+            - export DOCKER_IMAGE="$ECR_REGISTRY/{svc}:$BITBUCKET_COMMIT"
 {deploy_cmd}
 '''
 
@@ -849,28 +1110,30 @@ def generate_azure_pipelines(config: PipelineConfig) -> Dict[str, str]:
     """Generate Azure Pipelines configuration"""
     lang = LANG_CONFIG[config.language]
     files = {}
+    svc = config.service_name
 
     if config.target == Target.AKS:
         deploy_task = f'''                - task: Kubernetes@1
                   inputs:
                     connectionType: 'Azure Resource Manager'
                     azureSubscriptionEndpoint: '$(AZURE_SUBSCRIPTION)'
-                    kubernetesCluster: '{config.service_name}-$(ENV)'
+                    kubernetesCluster: '{svc}-$(ENV)'
                     command: 'set'
-                    arguments: 'image deployment/{config.service_name} {config.service_name}=$(containerRegistry)/{config.service_name}:$(Build.BuildId)' '''
+                    arguments: 'image deployment/{svc} {svc}=$(containerRegistry)/{svc}:$(Build.BuildId)' '''
     elif config.target == Target.EC2_SSH:
         deploy_task = f'''                - task: SSH@0
                   inputs:
                     sshEndpoint: 'ssh-$(ENV)'
                     commands: |
-                      docker pull $(containerRegistry)/{config.service_name}:$(Build.BuildId)
-                      docker stop {config.service_name} || true && docker rm {config.service_name} || true
-                      docker run -d --name {config.service_name} -p {lang["port"]}:{lang["port"]} $(containerRegistry)/{config.service_name}:$(Build.BuildId)'''
+                      set -euo pipefail
+                      docker pull $(containerRegistry)/{svc}:$(Build.BuildId)
+                      docker stop {svc} || true && docker rm {svc} || true
+                      docker run -d --name {svc} -p {lang["port"]}:{lang["port"]} $(containerRegistry)/{svc}:$(Build.BuildId)'''
     else:
         deploy_task = '''                - script: echo "Configure deployment"'''
 
-    azure = f'''# Azure Pipelines for {config.service_name}
-# Generated by PipeForge
+    azure = f'''# Azure Pipelines for {svc}
+# Generated by PipeForge v{__version__}
 
 trigger:
   branches:
@@ -902,7 +1165,7 @@ stages:
           - task: Docker@2
             inputs:
               command: buildAndPush
-              repository: {config.service_name}
+              repository: {svc}
               containerRegistry: $(dockerConnection)
               tags: $(Build.BuildId)
 '''
@@ -915,7 +1178,7 @@ stages:
         value: '{env}'
     jobs:
       - deployment: Deploy
-        environment: '{config.service_name}-{env}'
+        environment: '{svc}-{env}'
         pool:
           vmImage: 'ubuntu-latest'
         strategy:
@@ -934,75 +1197,127 @@ stages:
 # ============================================
 
 def generate_dockerfile(config: PipelineConfig) -> str:
-    """Generate optimized Dockerfile"""
+    """Generate optimized Dockerfile with security best practices"""
     lang = LANG_CONFIG[config.language]
+    svc = config.service_name
 
     if config.language == Language.NODEJS:
-        return f'''# Build stage
+        return f'''# Dockerfile for {svc}
+# Generated by PipeForge v{__version__}
+# Security: Multi-stage build, non-root user, health check
+
+# Build stage
 FROM node:{config.node_version}-alpine AS builder
 WORKDIR /app
+
+# Install dependencies first (better caching)
 COPY package*.json ./
 RUN npm ci --only=production && npm cache clean --force
+
+# Copy source and build
 COPY . .
 RUN npm run build
 
 # Production stage
 FROM node:{config.node_version}-alpine AS production
 WORKDIR /app
-RUN addgroup -g 1001 -S app && adduser -S app -u 1001 -G app
-COPY --from=builder --chown=app:app /app/dist ./dist
-COPY --from=builder --chown=app:app /app/node_modules ./node_modules
-COPY --from=builder --chown=app:app /app/package*.json ./
-USER app
+
+# Security: Create non-root user
+RUN addgroup -g 1001 -S appgroup && \\
+    adduser -S appuser -u 1001 -G appgroup
+
+# Copy only necessary files
+COPY --from=builder --chown=appuser:appgroup /app/dist ./dist
+COPY --from=builder --chown=appuser:appgroup /app/node_modules ./node_modules
+COPY --from=builder --chown=appuser:appgroup /app/package*.json ./
+
+# Security: Run as non-root
+USER appuser
+
+# Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \\
-  CMD wget --spider http://localhost:{lang["port"]}/health || exit 1
+  CMD wget --no-verbose --tries=1 --spider http://localhost:{lang["port"]}/health || exit 1
+
 EXPOSE {lang["port"]}
 CMD ["node", "dist/index.js"]
 '''
 
     elif config.language == Language.PYTHON:
-        return f'''# Build stage
+        return f'''# Dockerfile for {svc}
+# Generated by PipeForge v{__version__}
+# Security: Multi-stage build, non-root user, health check
+
+# Build stage
 FROM python:{config.python_version}-slim AS builder
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    build-essential && \\
+    rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt ./
 RUN pip install --no-cache-dir --user -r requirements.txt
 
 # Production stage
 FROM python:{config.python_version}-slim AS production
 WORKDIR /app
-RUN useradd --create-home app
-COPY --from=builder /root/.local /home/app/.local
-ENV PATH=/home/app/.local/bin:$PATH
-COPY --chown=app:app . .
-USER app
+
+# Security: Create non-root user
+RUN useradd --create-home --shell /bin/bash appuser
+
+COPY --from=builder /root/.local /home/appuser/.local
+ENV PATH=/home/appuser/.local/bin:$PATH
+
+COPY --chown=appuser:appuser . .
+
+# Security: Run as non-root
+USER appuser
+
+# Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=40s --retries=3 \\
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:{lang["port"]}/health')"
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:{lang["port"]}/health')" || exit 1
+
 EXPOSE {lang["port"]}
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "{lang["port"]}"]
 '''
 
     elif config.language == Language.GO:
-        return f'''# Build stage
+        return f'''# Dockerfile for {svc}
+# Generated by PipeForge v{__version__}
+# Security: Multi-stage build, distroless image, non-root user
+
+# Build stage
 FROM golang:{config.go_version}-alpine AS builder
 WORKDIR /app
+
 RUN apk --no-cache add ca-certificates tzdata
+
 COPY go.mod go.sum ./
 RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags='-w -s' -o /app/server ./cmd/server
 
-# Production stage
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \\
+    -ldflags='-w -s -extldflags "-static"' \\
+    -o /app/server ./cmd/server
+
+# Production stage - distroless for minimal attack surface
 FROM gcr.io/distroless/static-debian12 AS production
+
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /app/server /server
+
+# Security: Run as non-root
 USER nonroot:nonroot
+
 EXPOSE {lang["port"]}
 ENTRYPOINT ["/server"]
 '''
 
-    return f'''FROM {lang["image"]}
+    return f'''# Dockerfile for {svc}
+# Generated by PipeForge v{__version__}
+
+FROM {lang["image"]}
 WORKDIR /app
 COPY . .
 RUN {lang["install"]}
@@ -1016,13 +1331,17 @@ CMD ["./app"]
 # ============================================
 
 def generate_docker_compose(config: PipelineConfig) -> str:
-    """Generate docker-compose.yml"""
+    """Generate docker-compose.yml for local development"""
     lang = LANG_CONFIG[config.language]
+    svc = config.service_name
 
-    return f'''version: '3.8'
+    return f'''# Docker Compose for {svc}
+# Generated by PipeForge v{__version__}
+
+version: '3.8'
 
 services:
-  {config.service_name}:
+  {svc}:
     build:
       context: .
       target: production
@@ -1044,101 +1363,226 @@ services:
 # ============================================
 
 def generate_ssh_scripts(config: PipelineConfig) -> Dict[str, str]:
-    """Generate SSH deployment scripts"""
+    """Generate SSH deployment scripts with security best practices"""
     lang = LANG_CONFIG[config.language]
     files = {}
+    svc = config.service_name
 
     files["scripts/deploy-ssh.sh"] = f'''#!/bin/bash
-# SSH Deployment Script for {config.service_name}
-# Generated by PipeForge
+# SSH Deployment Script for {svc}
+# Generated by PipeForge v{__version__}
+# Security: Strict mode, input validation, error handling
+
 set -euo pipefail
+IFS=$'\\n\\t'
 
-SERVICE_NAME="{config.service_name}"
-DOCKER_IMAGE="${{DOCKER_IMAGE:-$1}}"
-ENVIRONMENT="${{ENVIRONMENT:-$2}}"
-HOSTS="${{HOSTS:-$3}}"
+# Configuration
+readonly SERVICE_NAME="{svc}"
+readonly DOCKER_IMAGE="${{DOCKER_IMAGE:-${{1:-}}}}"
+readonly ENVIRONMENT="${{ENVIRONMENT:-${{2:-}}}}"
+readonly HOSTS="${{HOSTS:-${{3:-}}}}"
+readonly MAX_FAILURE_PERCENT=30
+readonly DEPLOY_DELAY=10
+readonly HEALTH_CHECK_RETRIES=30
+readonly HEALTH_CHECK_DELAY=2
 
-log() {{ echo "[$(date +'%H:%M:%S')] $1"; }}
+# Logging
+log() {{ echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }}
+error() {{ echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $1" >&2; }}
 
-IFS=',' read -ra HOST_ARRAY <<< "$HOSTS"
-TOTAL=${{#HOST_ARRAY[@]}}
-FAILED=0
-
-log "Deploying $SERVICE_NAME to $TOTAL servers"
-
-for i in "${{!HOST_ARRAY[@]}}"; do
-    HOST="${{HOST_ARRAY[$i]}}"
-    log "[$((i+1))/$TOTAL] Deploying to $HOST..."
-
-    if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 deploy@"$HOST" << ENDSSH
-        set -e
-        docker pull $DOCKER_IMAGE
-        docker stop $SERVICE_NAME 2>/dev/null || true
-        docker rm $SERVICE_NAME 2>/dev/null || true
-        docker run -d --name $SERVICE_NAME --restart unless-stopped \\
-            -p {lang["port"]}:{lang["port"]} -e NODE_ENV=$ENVIRONMENT \\
-            --health-cmd="curl -f http://localhost:{lang["port"]}/health || exit 1" \\
-            --health-interval=30s --health-timeout=10s --health-retries=3 \\
-            $DOCKER_IMAGE
-        for attempt in {{1..30}}; do
-            if docker inspect --format='{{{{.State.Health.Status}}}}' $SERVICE_NAME | grep -q healthy; then exit 0; fi
-            sleep 2
-        done
+# Validation
+validate_inputs() {{
+    if [[ -z "$DOCKER_IMAGE" ]]; then
+        error "DOCKER_IMAGE is required"
         exit 1
-ENDSSH
-    then
-        log "SUCCESS: $HOST"
-    else
-        log "FAILED: $HOST"
-        ((FAILED++))
-        if (( FAILED * 100 / TOTAL > 30 )); then
-            log "Too many failures. Stopping."
-            exit 1
-        fi
     fi
-    [ $i -lt $((TOTAL-1)) ] && sleep 10
-done
+    if [[ -z "$ENVIRONMENT" ]]; then
+        error "ENVIRONMENT is required"
+        exit 1
+    fi
+    if [[ -z "$HOSTS" ]]; then
+        error "HOSTS is required"
+        exit 1
+    fi
+    # Validate environment name
+    if ! [[ "$ENVIRONMENT" =~ ^[a-z][a-z0-9-]{{0,30}}$ ]]; then
+        error "Invalid ENVIRONMENT format"
+        exit 1
+    fi
+}}
 
-[ $FAILED -eq 0 ] && log "All deployments successful!" || exit 1
+# Main deployment
+main() {{
+    validate_inputs
+
+    IFS=',' read -ra HOST_ARRAY <<< "$HOSTS"
+    local TOTAL=${{#HOST_ARRAY[@]}}
+    local FAILED=0
+    local SUCCESSFUL=0
+
+    log "Deploying $SERVICE_NAME to $TOTAL servers"
+    log "Image: $DOCKER_IMAGE"
+    log "Environment: $ENVIRONMENT"
+
+    for i in "${{!HOST_ARRAY[@]}}"; do
+        local HOST="${{HOST_ARRAY[$i]}}"
+
+        # Validate host format (basic IP/hostname check)
+        if ! [[ "$HOST" =~ ^[a-zA-Z0-9.-]+$ ]]; then
+            error "Invalid host format: $HOST"
+            ((FAILED++))
+            continue
+        fi
+
+        log "[$((i+1))/$TOTAL] Deploying to $HOST..."
+
+        if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o BatchMode=yes deploy@"$HOST" << ENDSSH
+            set -euo pipefail
+
+            echo "Pulling image..."
+            docker pull "$DOCKER_IMAGE"
+
+            echo "Stopping old container..."
+            docker stop "$SERVICE_NAME" 2>/dev/null || true
+            docker rm "$SERVICE_NAME" 2>/dev/null || true
+
+            echo "Starting new container..."
+            docker run -d \\
+                --name "$SERVICE_NAME" \\
+                --restart unless-stopped \\
+                -p {lang["port"]}:{lang["port"]} \\
+                -e NODE_ENV="$ENVIRONMENT" \\
+                --health-cmd="curl -f http://localhost:{lang["port"]}/health || exit 1" \\
+                --health-interval=30s \\
+                --health-timeout=10s \\
+                --health-retries=3 \\
+                "$DOCKER_IMAGE"
+
+            echo "Waiting for health check..."
+            for attempt in $(seq 1 $HEALTH_CHECK_RETRIES); do
+                if docker inspect --format='{{{{.State.Health.Status}}}}' "$SERVICE_NAME" 2>/dev/null | grep -q healthy; then
+                    echo "Container is healthy"
+                    exit 0
+                fi
+                sleep $HEALTH_CHECK_DELAY
+            done
+
+            echo "Health check failed"
+            docker logs "$SERVICE_NAME" --tail 50
+            exit 1
+ENDSSH
+        then
+            log "SUCCESS: $HOST"
+            ((SUCCESSFUL++))
+        else
+            error "FAILED: $HOST"
+            ((FAILED++))
+
+            # Check failure threshold
+            if (( FAILED * 100 / TOTAL > MAX_FAILURE_PERCENT )); then
+                error "Failure threshold exceeded ($FAILED/$TOTAL). Stopping deployment."
+                exit 1
+            fi
+        fi
+
+        # Delay between deployments (rolling)
+        if [[ $i -lt $((TOTAL-1)) ]]; then
+            log "Waiting ${{DEPLOY_DELAY}}s before next deployment..."
+            sleep $DEPLOY_DELAY
+        fi
+    done
+
+    # Summary
+    log "========================================"
+    log "Deployment Summary"
+    log "========================================"
+    log "Total: $TOTAL | Successful: $SUCCESSFUL | Failed: $FAILED"
+
+    if [[ $FAILED -gt 0 ]]; then
+        error "Deployment completed with failures"
+        exit 1
+    fi
+
+    log "All deployments successful!"
+}}
+
+main "$@"
 '''
 
     files["scripts/discover-hosts.sh"] = f'''#!/bin/bash
 # Discover EC2 hosts by tags
+# Generated by PipeForge v{__version__}
+
 set -euo pipefail
 
-SERVICE="{config.service_name}"
-ENV="${{1:-dev}}"
-REGION="${{AWS_REGION:-{config.aws_region}}}"
+readonly SERVICE="{svc}"
+readonly ENV="${{1:-dev}}"
+readonly REGION="${{AWS_REGION:-{config.aws_region}}}"
+
+# Validate environment
+if ! [[ "$ENV" =~ ^[a-z][a-z0-9-]{{0,30}}$ ]]; then
+    echo "Invalid environment format" >&2
+    exit 1
+fi
 
 HOSTS=$(aws ec2 describe-instances \\
     --region "$REGION" \\
-    --filters "Name=tag:Service,Values=$SERVICE" "Name=tag:Environment,Values=$ENV" "Name=instance-state-name,Values=running" \\
+    --filters \\
+        "Name=tag:Service,Values=$SERVICE" \\
+        "Name=tag:Environment,Values=$ENV" \\
+        "Name=instance-state-name,Values=running" \\
     --query 'Reservations[].Instances[].PrivateIpAddress' \\
     --output text | tr '\\n' ',' | sed 's/,$//')
+
+if [[ -z "$HOSTS" ]]; then
+    echo "No hosts found" >&2
+    exit 1
+fi
 
 echo "$HOSTS"
 '''
 
     files["scripts/setup-server.sh"] = f'''#!/bin/bash
-# Setup server for {config.service_name}
+# Setup server for {svc}
+# Generated by PipeForge v{__version__}
+
 set -euo pipefail
 
-echo "Setting up server..."
+echo "Setting up server for {svc}..."
 
+# Install Docker if not present
 if ! command -v docker &> /dev/null; then
+    echo "Installing Docker..."
     curl -fsSL https://get.docker.com | sh
-    systemctl enable docker && systemctl start docker
+    systemctl enable docker
+    systemctl start docker
 fi
 
+# Create deploy user if not exists
 if ! id "deploy" &>/dev/null; then
+    echo "Creating deploy user..."
     useradd -m -s /bin/bash deploy
     usermod -aG docker deploy
 fi
 
-mkdir -p /opt/{config.service_name}
-chown -R deploy:deploy /opt/{config.service_name}
+# Setup directories
+mkdir -p /opt/{svc}
+mkdir -p /var/log/{svc}
+chown -R deploy:deploy /opt/{svc}
+chown -R deploy:deploy /var/log/{svc}
 
-echo "Setup complete! Add SSH key to /home/deploy/.ssh/authorized_keys"
+# Setup SSH directory
+mkdir -p /home/deploy/.ssh
+chmod 700 /home/deploy/.ssh
+touch /home/deploy/.ssh/authorized_keys
+chmod 600 /home/deploy/.ssh/authorized_keys
+chown -R deploy:deploy /home/deploy/.ssh
+
+echo "Setup complete!"
+echo ""
+echo "Next steps:"
+echo "1. Add CI/CD SSH public key to /home/deploy/.ssh/authorized_keys"
+echo "2. Tag this instance with Service={svc} and Environment=<env>"
 '''
 
     return files
@@ -1150,28 +1594,64 @@ echo "Setup complete! Add SSH key to /home/deploy/.ssh/authorized_keys"
 
 def generate_secrets_doc(config: PipelineConfig) -> str:
     """Generate secrets documentation"""
+    svc = config.service_name
     secrets = []
 
     if config.registry == Registry.ECR:
-        secrets.append(("AWS_ROLE_ARN", "IAM role ARN for OIDC authentication"))
+        secrets.append(("AWS_ROLE_ARN", "IAM role ARN for OIDC authentication", "Required"))
         for env in config.environments:
-            secrets.append((f"AWS_ROLE_ARN_{env.upper()}", f"IAM role for {env} deployments"))
+            secrets.append((f"AWS_ROLE_ARN_{env.upper()}", f"IAM role for {env} deployments", "Required"))
 
     if config.target == Target.EC2_SSH:
-        secrets.append(("SSH_PRIVATE_KEY", "SSH private key for deployment"))
+        secrets.append(("SSH_PRIVATE_KEY", "SSH private key for deployment", "Required"))
         for env in config.environments:
-            secrets.append((f"SSH_HOSTS_{env.upper()}", f"Comma-separated {env} server IPs"))
+            secrets.append((f"SSH_HOSTS_{env.upper()}", f"Comma-separated {env} server IPs", "Required"))
 
     for env in config.environments:
-        secrets.append((f"{env.upper()}_URL", f"Base URL for {env} health checks"))
+        secrets.append((f"{env.upper()}_URL", f"Base URL for {env} health checks", "Required"))
 
-    secrets.append(("CODECOV_TOKEN", "Codecov token (optional)"))
-    secrets.append(("SLACK_WEBHOOK_URL", "Slack webhook (optional)"))
+    secrets.append(("CODECOV_TOKEN", "Codecov token for coverage reports", "Optional"))
+    secrets.append(("SLACK_WEBHOOK_URL", "Slack webhook for notifications", "Optional"))
 
-    doc = "# Required Secrets\n\nConfigure these in your CI/CD platform:\n\n"
-    doc += "| Secret | Description |\n|--------|-------------|\n"
-    for name, desc in secrets:
-        doc += f"| `{name}` | {desc} |\n"
+    doc = f'''# Required Secrets for {svc}
+
+Generated by PipeForge v{__version__}
+
+## Configuration
+
+Configure these secrets in your CI/CD platform settings.
+
+| Secret | Description | Status |
+|--------|-------------|--------|
+'''
+    for name, desc, status in secrets:
+        doc += f"| `{name}` | {desc} | {status} |\n"
+
+    doc += '''
+## Security Best Practices
+
+1. **Never commit secrets** to version control
+2. **Use OIDC** instead of long-lived credentials where possible
+3. **Rotate secrets** regularly
+4. **Limit scope** - use least privilege principle
+5. **Audit access** - monitor secret usage
+
+## Platform-Specific Setup
+
+### GitHub Actions
+- Go to Settings > Secrets and variables > Actions
+- Add each secret as a Repository secret
+- For environments, create Environments and add environment-specific secrets
+
+### GitLab CI
+- Go to Settings > CI/CD > Variables
+- Add variables with appropriate scope (project/group)
+- Mark sensitive values as "Masked"
+
+### CircleCI
+- Go to Project Settings > Environment Variables
+- Create contexts for environment-specific secrets
+'''
 
     return doc
 
@@ -1181,35 +1661,51 @@ def generate_secrets_doc(config: PipelineConfig) -> str:
 # ============================================
 
 def generate_pipeline(config: PipelineConfig) -> Dict[str, str]:
-    """Generate all pipeline files"""
+    """
+    Generate all pipeline files.
+
+    Args:
+        config: Validated PipelineConfig instance
+
+    Returns:
+        Dictionary of filename -> content
+    """
     files = {}
 
-    # CI/CD config
-    if config.platform == Platform.GITHUB_ACTIONS:
-        files.update(generate_github_actions(config))
-    elif config.platform == Platform.GITLAB_CI:
-        files.update(generate_gitlab_ci(config))
-    elif config.platform == Platform.CIRCLECI:
-        files.update(generate_circleci(config))
-    elif config.platform == Platform.BITBUCKET:
-        files.update(generate_bitbucket(config))
-    elif config.platform == Platform.AZURE_PIPELINES:
-        files.update(generate_azure_pipelines(config))
+    # CI/CD config based on platform
+    generators = {
+        Platform.GITHUB_ACTIONS: generate_github_actions,
+        Platform.GITLAB_CI: generate_gitlab_ci,
+        Platform.CIRCLECI: generate_circleci,
+        Platform.BITBUCKET: generate_bitbucket,
+        Platform.AZURE_PIPELINES: generate_azure_pipelines,
+    }
+
+    generator = generators.get(config.platform)
+    if generator:
+        files.update(generator(config))
 
     # Common files
     files["Dockerfile"] = generate_dockerfile(config)
     files["docker-compose.yml"] = generate_docker_compose(config)
-    files[".dockerignore"] = '''node_modules/
+    files[".dockerignore"] = '''# Generated by PipeForge
+node_modules/
 __pycache__/
 *.pyc
 .git/
 .github/
+.gitlab-ci.yml
+.circleci/
 *.md
 .env*
 coverage/
+.pytest_cache/
+*.log
+.DS_Store
+Thumbs.db
 '''
 
-    # SSH scripts
+    # SSH scripts if needed
     if config.target == Target.EC2_SSH:
         files.update(generate_ssh_scripts(config))
 
@@ -1219,9 +1715,60 @@ coverage/
     return files
 
 
-def save_files(files: Dict[str, str], output_dir: str):
-    """Save generated files to disk"""
-    output_path = Path(output_dir)
+def validate_output_path(path_str: str) -> Path:
+    """
+    Validate output directory path.
+    Allows backslashes for Windows paths but blocks dangerous patterns.
+
+    Args:
+        path_str: Path string to validate
+
+    Returns:
+        Resolved Path object
+
+    Raises:
+        ValidationError: If validation fails
+        SecurityError: If dangerous patterns detected
+    """
+    if not isinstance(path_str, str):
+        raise ValidationError("output_dir must be a string")
+
+    path_str = path_str.strip()
+    if not path_str:
+        raise ValidationError("output_dir cannot be empty")
+
+    if len(path_str) > 500:
+        raise ValidationError("output_dir exceeds maximum length")
+
+    # Check for specific dangerous patterns (but allow backslashes for Windows)
+    dangerous = [
+        r'[;&|`$]',        # Command injection chars
+        r'[\x00-\x1f]',    # Control characters
+    ]
+    for pattern in dangerous:
+        if re.search(pattern, path_str):
+            raise SecurityError("output_dir contains potentially dangerous characters")
+
+    return Path(path_str).resolve()
+
+
+def save_files(files: Dict[str, str], output_dir: str) -> None:
+    """
+    Save generated files to disk.
+
+    Args:
+        files: Dictionary of filename -> content
+        output_dir: Output directory path
+    """
+    # Validate output directory (Windows-compatible)
+    output_path = validate_output_path(output_dir)
+
+    # Security: Ensure output is not in system directories
+    dangerous_paths = ['/etc', '/usr', '/bin', '/sbin', '/var', '/root', 'C:\\Windows', 'C:\\Program Files']
+    for dp in dangerous_paths:
+        if str(output_path).startswith(dp):
+            raise SecurityError(f"Cannot write to system directory: {output_path}")
+
     output_path.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
@@ -1230,15 +1777,23 @@ def save_files(files: Dict[str, str], output_dir: str):
 
     for filepath, content in files.items():
         full_path = output_path / filepath
+
+        # Security: Validate path doesn't escape output directory
+        try:
+            full_path.resolve().relative_to(output_path.resolve())
+        except ValueError:
+            raise SecurityError(f"Path traversal detected: {filepath}")
+
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(content, encoding="utf-8")
         print(f"  [+] {filepath}")
 
+        # Make scripts executable
         if filepath.endswith(".sh"):
             full_path.chmod(0o755)
 
     print(f"\n{'='*60}")
-    print(f"  Output: {output_path.absolute()}")
+    print(f"  Output: {output_path}")
     print('='*60 + "\n")
 
 
@@ -1247,69 +1802,110 @@ def save_files(files: Dict[str, str], output_dir: str):
 # ============================================
 
 def prompt_choice(question: str, options: list, default: int = 0) -> int:
-    """Prompt for choice"""
+    """Prompt for choice with validation"""
     print(f"\n{question}")
     for i, opt in enumerate(options):
         marker = " *" if i == default else ""
         print(f"  {i + 1}. {opt}{marker}")
 
     while True:
-        choice = input(f"  Select [1-{len(options)}] (default: {default + 1}): ").strip()
-        if not choice:
-            return default
         try:
+            choice = input(f"  Select [1-{len(options)}] (default: {default + 1}): ").strip()
+            if not choice:
+                return default
             idx = int(choice) - 1
             if 0 <= idx < len(options):
                 return idx
+            print("  Invalid choice. Please try again.")
         except ValueError:
-            pass
-        print("  Invalid choice.")
+            print("  Invalid input. Please enter a number.")
+        except KeyboardInterrupt:
+            print("\n  Cancelled.")
+            sys.exit(0)
 
 
 def prompt_text(question: str, default: str) -> str:
-    """Prompt for text"""
-    value = input(f"\n{question} [{default}]: ").strip()
-    return value if value else default
+    """Prompt for text with validation"""
+    try:
+        value = input(f"\n{question} [{default}]: ").strip()
+        return value if value else default
+    except KeyboardInterrupt:
+        print("\n  Cancelled.")
+        sys.exit(0)
 
 
 def interactive_mode() -> PipelineConfig:
-    """Interactive configuration"""
-    config = PipelineConfig()
-
+    """Interactive configuration with validation"""
     platforms = list(Platform)
-    config.platform = platforms[prompt_choice("CI/CD Platform:", [p.value for p in platforms])]
+    platform = platforms[prompt_choice("CI/CD Platform:", [p.value for p in platforms])]
 
     languages = list(Language)
-    config.language = languages[prompt_choice("Language:", [LANG_CONFIG[l]["display"] for l in languages])]
+    language = languages[prompt_choice("Language:", [LANG_CONFIG[l]["display"] for l in languages])]
 
     targets = list(Target)
-    config.target = targets[prompt_choice("Deployment Target:", [t.value for t in targets])]
+    target = targets[prompt_choice("Deployment Target:", [t.value for t in targets])]
 
     registries = list(Registry)
-    config.registry = registries[prompt_choice("Container Registry:", [r.value for r in registries])]
+    registry = registries[prompt_choice("Container Registry:", [r.value for r in registries])]
 
     env_opts = ["dev only", "dev + staging", "dev + staging + prod"]
     env_choice = prompt_choice("Environments:", env_opts, 2)
-    config.environments = ["dev"] if env_choice == 0 else ["dev", "staging"] if env_choice == 1 else ["dev", "staging", "prod"]
+    environments = ["dev"] if env_choice == 0 else ["dev", "staging"] if env_choice == 1 else ["dev", "staging", "prod"]
 
-    config.service_name = prompt_text("Service name:", "my-app")
-    config.aws_region = prompt_text("AWS Region:", "us-east-1")
-    config.include_tests = input("\nInclude tests? [Y/n]: ").strip().lower() != 'n'
-    config.include_security_scan = input("Include security scan? [Y/n]: ").strip().lower() != 'n'
+    # Get and validate service name
+    while True:
+        service_name = prompt_text("Service name", "my-app")
+        try:
+            service_name = validate_service_name(service_name)
+            break
+        except (ValidationError, SecurityError) as e:
+            print(f"  Error: {e}. Please try again.")
 
-    return config
+    # Get and validate AWS region
+    while True:
+        aws_region = prompt_text("AWS Region", "us-east-1")
+        try:
+            aws_region = validate_aws_region(aws_region)
+            break
+        except (ValidationError, SecurityError) as e:
+            print(f"  Error: {e}. Please try again.")
+
+    include_tests = input("\nInclude tests? [Y/n]: ").strip().lower() != 'n'
+    include_security_scan = input("Include security scan? [Y/n]: ").strip().lower() != 'n'
+
+    return PipelineConfig(
+        service_name=service_name,
+        platform=platform,
+        language=language,
+        target=target,
+        registry=registry,
+        environments=environments,
+        aws_region=aws_region,
+        include_tests=include_tests,
+        include_security_scan=include_security_scan,
+    )
 
 
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
         description="PipeForge - Production-Ready CI/CD Pipeline Generator",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  %(prog)s                                    # Interactive mode
+  %(prog)s -p github -l nodejs -t ecs -n api  # Command line mode
+  %(prog)s --platform gitlab --language python --target ssh --name backend
+
+Version: {__version__}
+Author: {__author__}
+Repository: https://github.com/Sheraz-k/pipeforge
+"""
     )
-    parser.add_argument("--platform", "-p", help="CI/CD platform (github/gitlab/circleci/bitbucket/azure)")
-    parser.add_argument("--language", "-l", help="Language (nodejs/python/go/java/dotnet/rust)")
-    parser.add_argument("--target", "-t", help="Deploy target (ecs/eks/ssh/aks/cloudrun/k8s)")
-    parser.add_argument("--registry", "-r", help="Container registry (ecr/dockerhub/ghcr/acr)")
+    parser.add_argument("--platform", "-p", help="CI/CD platform")
+    parser.add_argument("--language", "-l", help="Programming language")
+    parser.add_argument("--target", "-t", help="Deployment target")
+    parser.add_argument("--registry", "-r", help="Container registry")
     parser.add_argument("--name", "-n", help="Service name")
     parser.add_argument("--output", "-o", help="Output directory")
     parser.add_argument("--region", help="AWS region", default="us-east-1")
@@ -1319,42 +1915,52 @@ def main():
 
     print("\n" + "="*60)
     print("  PipeForge - CI/CD Pipeline Generator")
-    print("  No AI | No API | No Dependencies")
+    print(f"  Version {__version__} | No AI | No API | Secure")
     print("="*60)
 
-    # Non-interactive mode
-    if args.platform and args.language and args.target:
-        config = PipelineConfig(
-            platform=Platform.from_string(args.platform),
-            language=Language.from_string(args.language),
-            target=Target.from_string(args.target),
-            registry=Registry.from_string(args.registry) if args.registry else Registry.ECR,
-            service_name=args.name or "my-app",
-            aws_region=args.region
-        )
-    else:
-        config = interactive_mode()
+    try:
+        # Non-interactive mode if all required args provided
+        if args.platform and args.language and args.target:
+            config = PipelineConfig(
+                platform=Platform.from_string(args.platform),
+                language=Language.from_string(args.language),
+                target=Target.from_string(args.target),
+                registry=Registry.from_string(args.registry) if args.registry else Registry.ECR,
+                service_name=args.name or "my-app",
+                aws_region=args.region,
+            )
+        else:
+            config = interactive_mode()
 
-    # Summary
-    print(f"\n{'-'*60}")
-    print("  Configuration")
-    print(f"{'-'*60}")
-    print(f"  Platform: {config.platform.value}")
-    print(f"  Language: {LANG_CONFIG[config.language]['display']}")
-    print(f"  Target:   {config.target.value}")
-    print(f"  Service:  {config.service_name}")
-    print(f"{'-'*60}")
+        # Summary
+        print(f"\n{'-'*60}")
+        print("  Configuration")
+        print(f"{'-'*60}")
+        print(f"  Platform:    {config.platform.value}")
+        print(f"  Language:    {LANG_CONFIG[config.language]['display']}")
+        print(f"  Target:      {config.target.value}")
+        print(f"  Service:     {config.service_name}")
+        print(f"  Region:      {config.aws_region}")
+        print(f"  Environments: {', '.join(config.environments)}")
+        print(f"{'-'*60}")
 
-    if input("\nGenerate? [Y/n]: ").strip().lower() == 'n':
-        print("Cancelled.")
-        return
+        if input("\nGenerate pipeline? [Y/n]: ").strip().lower() == 'n':
+            print("Cancelled.")
+            return
 
-    # Generate
-    files = generate_pipeline(config)
+        # Generate
+        files = generate_pipeline(config)
 
-    # Save
-    output_dir = args.output or prompt_text("Output directory:", "./generated-pipeline")
-    save_files(files, output_dir)
+        # Save
+        output_dir = args.output or prompt_text("Output directory", "./generated-pipeline")
+        save_files(files, output_dir)
+
+    except (ValidationError, SecurityError) as e:
+        print(f"\nError: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
