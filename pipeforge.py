@@ -1310,6 +1310,12 @@ COPY --from=builder /app/server /server
 # Security: Run as non-root
 USER nonroot:nonroot
 
+# Note: Distroless images don't support HEALTHCHECK CMD
+# Health checks should be configured at orchestration level:
+# - ECS: task definition healthCheck
+# - K8s: livenessProbe/readinessProbe
+# - Docker Compose: healthcheck with curl from sidecar
+
 EXPOSE {lang["port"]}
 ENTRYPOINT ["/server"]
 '''
